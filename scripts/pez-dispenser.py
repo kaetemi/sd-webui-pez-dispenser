@@ -14,7 +14,7 @@ from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 from PIL import Image
 
-VERSION = "1.4.1"
+VERSION = "1.4.1-anime"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -266,7 +266,7 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
             float(lr),
             float(weight_decay),
             int(prompt_bs),
-            None,
+            100,
             int(batch_size),
             target_images = parsed_images if len(parsed_images) > 0 else None,
             target_prompts = parsed_prompts if not parsed_prompts is None else None,
@@ -798,7 +798,7 @@ class Script(scripts.Script):
                         float(lr),
                         float(weight_decay),
                         int(prompt_bs),
-                        None,
+                        100,
                         int(batch_size),
                         target_images = target_images,
                         target_prompts = target_prompts,

@@ -1,4 +1,7 @@
 import time
+import string
+import unicodedata
+import os
 import copy
 import open_clip
 import torch
@@ -8,6 +11,54 @@ class State:
     installed = False
 
 state = State()
+
+# Global variable for caching the anime direction
+cached_anime_direction = None
+
+def remove_anime_direction(embedding, anime_direction, strength=1.0):
+    """Remove the 'anime' direction from the embedding."""
+    # projection = torch.sum(embedding * anime_direction, dim=-1, keepdim=True) * anime_direction
+    # return embedding - strength * projection
+    return embedding - strength * anime_direction
+
+def load_anime_direction(device):
+    """Load the pre-computed anime direction with caching."""
+    global cached_anime_direction
+    
+    if cached_anime_direction is not None:
+        return cached_anime_direction
+
+    anime_direction_path = os.path.join(os.path.dirname(__file__), 'anime_direction_1024.pt')
+    if os.path.exists(anime_direction_path):
+        anime_direction = torch.load(anime_direction_path, map_location=device)
+        cached_anime_direction = anime_direction.to(device)
+        return cached_anime_direction
+    else:
+        print("Warning: anime_direction.pt not found. Proceeding without anime direction removal.")
+        return None
+
+def is_valid_prompt(text):
+    # Check for UTF-8 replacement character
+    if '\uFFFD' in text:
+        return False
+
+    # Check for tabs
+    if '\t' in text:
+        return False
+
+    # Check for excessive spaces
+    if '  ' in text or text.strip() != text:
+        return False
+    
+    # Check for functional punctuation
+    if any(char in '()[]<>:~' for char in text):
+        return False
+    
+    # Check for any punctuation (including Unicode)
+    if any(unicodedata.category(char).startswith('P') for char in text):
+        return False
+
+    return True
 
 ##################################################
 #try:
@@ -186,18 +237,28 @@ def decode_ids(input_ids, tokenizer, by_token=False):
     return texts
 
 
-def get_target_feature_images(model, preprocess, device, target_images):
+def get_target_feature_images(model, preprocess, device, target_images, remove_anime=True):
+    anime_direction = load_anime_direction(device) if remove_anime else None
+    
     with torch.no_grad():
         curr_images = [preprocess(i).unsqueeze(0) for i in target_images]
         curr_images = torch.concatenate(curr_images).to(device)
         all_target_features = model.encode_image(curr_images)
+        
+        if anime_direction is not None:
+            all_target_features = remove_anime_direction(all_target_features, anime_direction)
 
     return all_target_features
 
 
-def get_target_feature_prompts(model, tokenizer_funct, device, target_prompts):
+def get_target_feature_prompts(model, tokenizer_funct, device, target_prompts, remove_anime=True):
+    anime_direction = load_anime_direction(device) if remove_anime else None
+    
     texts = tokenizer_funct(target_prompts).to(device)
     all_target_features = model.encode_text(texts)
+    
+    if anime_direction is not None:
+        all_target_features = remove_anime_direction(all_target_features, anime_direction)
 
     return all_target_features
 
@@ -278,8 +339,10 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
 
     best_sim = 0
     best_text = ""
+    last_valid_embeds = None
     
-    for step in range(opt_iters):
+    step = 0
+    while step < opt_iters:
         if shared.state.interrupted:
             break
         if not on_progress is None:
@@ -309,37 +372,61 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
             universal_cosim_score = scores_per_prompt.max().item()
             best_indx = scores_per_prompt.argmax().item()
         
-        tmp_embeds = prompt_embeds.detach().clone()
-        tmp_embeds.data = projected_embeds.data
-        tmp_embeds.requires_grad = True
-        
-        # padding
-        padded_embeds = dummy_embeds.detach().clone()
-        padded_embeds[dummy_ids == -1] = tmp_embeds.reshape(-1, p_dim)
-        
-        logits_per_image, _ = forward_text_embedding(model, padded_embeds, dummy_ids, target_features)
-        cosim_scores = logits_per_image
-        loss = 1 - cosim_scores.mean()
-        
-        prompt_embeds.grad, = torch.autograd.grad(loss, [tmp_embeds])
-        
-        input_optimizer.step()
-        input_optimizer.zero_grad()
-
-        curr_lr = input_optimizer.param_groups[0]["lr"]
-        cosim_scores = cosim_scores.mean().item()
-
         decoded_text = decode_ids(nn_indices, tokenizer)[best_indx]
-        if print_step is not None and (step % print_step == 0 or step == opt_iters-1):
-            print(f"step: {step}, lr: {curr_lr}, cosim: {universal_cosim_score:.3f}, text: {decoded_text}")
         
-        if best_sim < universal_cosim_score:
-            best_sim = universal_cosim_score
+        if is_valid_prompt(decoded_text):
+            # Valid prompt, proceed with optimization
+            if best_sim < universal_cosim_score:
+                best_sim = universal_cosim_score
+                best_text = decoded_text
+
+            # Store the current valid embeddings
+            last_valid_embeds = prompt_embeds.detach().clone()
+
+            tmp_embeds = prompt_embeds.detach().clone()
+            tmp_embeds.data = projected_embeds.data
+            tmp_embeds.requires_grad = True
             
-            best_text = decoded_text
+            # padding
+            padded_embeds = dummy_embeds.detach().clone()
+            padded_embeds[dummy_ids == -1] = tmp_embeds.reshape(-1, p_dim)
+            
+            logits_per_image, _ = forward_text_embedding(model, padded_embeds, dummy_ids, target_features)
+            cosim_scores = logits_per_image
+            loss = 1 - cosim_scores.mean()
+            
+            prompt_embeds.grad, = torch.autograd.grad(loss, [tmp_embeds])
+            
+            input_optimizer.step()
+            input_optimizer.zero_grad()
+
+            curr_lr = input_optimizer.param_groups[0]["lr"]
+            cosim_scores = cosim_scores.mean().item()
+
+            if print_step is not None and (step % print_step == 0 or step == opt_iters-1):
+                print(f"")
+                print(f"step: {step}, lr: {curr_lr}, cosim: {universal_cosim_score:.3f}, text: {decoded_text}")
+                print(f"current best: {best_text}, cosim: {best_sim:.3f}")
+                print(f"")
+
+            step += 1
+        else:
+            # Invalid prompt, redo from last valid step with different randomization
+            # print(f"Invalid prompt at step {step}, redoing with different randomization...")
+            # print(f"invalid text: {decoded_text}")
+            if last_valid_embeds is not None:
+                prompt_embeds = last_valid_embeds + torch.randn_like(last_valid_embeds) * 0.1  # Add small random noise
+            else:
+                # If no valid step yet, reinitialize randomly
+                prompt_ids = torch.randint(len(tokenizer.encoder), (prompt_bs, prompt_len)).to(device)
+                prompt_embeds = token_embedding(prompt_ids).detach()
+            prompt_embeds.requires_grad = True
+            input_optimizer = torch.optim.AdamW([prompt_embeds], lr=lr, weight_decay=weight_decay)
+
+            step += 1
 
     if not on_progress is None:
-        on_progress(step + 1, opt_iters, best_text, progress_args)
+        on_progress(step, opt_iters, best_text, progress_args)
 
     if print_step is not None:
         print()
@@ -349,7 +436,7 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
     return best_text
 
 
-def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size, target_images=None, target_prompts=None, on_progress=None, progress_steps=[1], progress_args=None):
+def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size, target_images=None, target_prompts=None, on_progress=None, progress_steps=[1], progress_args=None, remove_anime=True):
     if not state.installed:
         raise ModuleNotFoundError("Some required packages are not installed")
 
@@ -358,10 +445,10 @@ def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters
 
     # get target features
     if not target_images is None:
-        all_target_features = get_target_feature_images(model, preprocess, device, target_images)
+        all_target_features = get_target_feature_images(model, preprocess, device, target_images, remove_anime)
     elif not target_prompts is None:
         tokenizer_funct = open_clip.get_tokenizer(clip_model)
-        all_target_features = get_target_feature_prompts(model, tokenizer_funct, device, target_prompts)
+        all_target_features = get_target_feature_prompts(model, tokenizer_funct, device, target_prompts, remove_anime)
     else:
         raise ValueError("No input images or prompts")
     
